@@ -840,7 +840,7 @@ export async function main(args: string[], options?: MainOptions) {
 		stdinContent,
 	);
 	time("prepareInitialMessage");
-	initTheme(settingsManager.getTheme(), appMode === "interactive");
+	initTheme(parsed.useTheme ?? settingsManager.getTheme(), appMode === "interactive");
 	time("initTheme");
 
 	// Show deprecation warnings in interactive mode
@@ -892,6 +892,7 @@ export async function main(args: string[], options?: MainOptions) {
 			initialMessages: parsed.messages,
 			verbose: parsed.verbose,
 			uiMode: parsed.uiMode,
+			themeOverride: parsed.useTheme,
 		});
 		if (startupBenchmark) {
 			await interactiveMode.init();

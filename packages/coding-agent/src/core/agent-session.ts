@@ -54,6 +54,7 @@ import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import {
+	type CompactionPreparation,
 	type CompactionResult,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
@@ -65,6 +66,7 @@ import {
 	shouldCompact,
 } from "./compaction/index.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
+import { areExperimentalFeaturesEnabled } from "./experimental.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
@@ -1790,6 +1792,86 @@ export class AgentSession {
 	// =========================================================================
 
 	/**
+	 * Generate Pi's built-in compaction summary for manual and automatic compaction.
+	 * Extension-provided summaries bypass this method.
+	 *
+	 * Normal mode preserves the established standalone summarization request: conversation
+	 * messages are serialized into a new prompt, with a fresh routing session and without
+	 * forwarding active-agent request hooks or transport options.
+	 *
+	 * Experimental mode builds each summarized source prefix through the active agent's
+	 * `transformContext` and `convertToLlm` pipeline, retains its system prompt and tools,
+	 * and forwards its routing and provider request options. This makes the prefix match a
+	 * normal agent request so providers can read it from prompt cache. The summarization
+	 * instruction is appended after that prefix and cache writes remain disabled because
+	 * the resulting one-off request is not expected to be reused.
+	 */
+	private async _runDefaultCompaction(
+		preparation: CompactionPreparation,
+		requestModel: Model<any>,
+		apiKey: string | undefined,
+		headers: Record<string, string> | undefined,
+		customInstructions: string | undefined,
+		signal: AbortSignal,
+		env: Record<string, string> | undefined,
+		reason: "manual" | "threshold" | "overflow",
+	): Promise<CompactionResult> {
+		// Preserve standalone summarization for normal users. Experimental mode instead
+		// reuses the active agent context and request options to make compaction cache-friendly.
+		if (!areExperimentalFeaturesEnabled()) {
+			return compact(
+				preparation,
+				requestModel,
+				apiKey,
+				headers,
+				customInstructions,
+				signal,
+				this.thinkingLevel,
+				this.agent.streamFunction,
+				env,
+				this.settingsManager.getRetrySettings(),
+				this._summarizationRetryCallbacks({ source: "compaction", reason }),
+			);
+		}
+
+		const systemPrompt = this.agent.state.systemPrompt;
+		const tools = this.agent.state.tools.slice();
+		const buildSourceContext = async (messages: AgentMessage[]) =>
+			this.agent.buildProviderContext({ systemPrompt, messages: messages.slice(), tools: tools.slice() }, signal);
+
+		const sourceContext =
+			preparation.messagesToSummarize.length > 0 && preparation.sourceMessages
+				? await buildSourceContext(preparation.sourceMessages)
+				: undefined;
+		const turnPrefixSourceContext =
+			preparation.isSplitTurn && preparation.turnPrefixMessages.length > 0 && preparation.turnPrefixSourceMessages
+				? await buildSourceContext(preparation.turnPrefixSourceMessages)
+				: undefined;
+
+		return compact(
+			preparation,
+			requestModel,
+			apiKey,
+			headers,
+			customInstructions,
+			signal,
+			this.thinkingLevel,
+			this.agent.streamFunction,
+			env,
+			this.settingsManager.getRetrySettings(),
+			this._summarizationRetryCallbacks({ source: "compaction", reason }),
+			this.agent.sessionId,
+			this.agent.onPayload,
+			this.agent.onResponse,
+			this.agent.transport,
+			this.agent.thinkingBudgets,
+			this.agent.maxRetryDelayMs,
+			sourceContext,
+			turnPrefixSourceContext,
+		);
+	}
+
+	/**
 	 * Manually compact the session context.
 	 *
 	 * This is the manual entry point used by `/compact`, RPC, and extensions. It is
@@ -1868,26 +1950,15 @@ export class AgentSession {
 				details = extensionCompaction.details;
 			} else {
 				// Shared default summary generator, also used by automatic compaction.
-				const result = await compact(
+				const result = await this._runDefaultCompaction(
 					preparation,
 					requestModel,
 					apiKey,
 					headers,
 					customInstructions,
 					this._compactionAbortController.signal,
-					this.thinkingLevel,
-					this.agent.streamFunction,
 					env,
-					this.settingsManager.getRetrySettings(),
-					this._summarizationRetryCallbacks({ source: "compaction", reason: "manual" }),
-					undefined, // sessionId
-					undefined, // onPayload
-					undefined, // onResponse
-					undefined, // transport
-					undefined, // thinkingBudgets
-					undefined, // maxRetryDelayMs
-					undefined, // sourceContext
-					undefined, // turnPrefixSourceContext
+					"manual",
 				);
 				summary = result.summary;
 				firstKeptEntryId = result.firstKeptEntryId;
@@ -2188,26 +2259,15 @@ export class AgentSession {
 				details = extensionCompaction.details;
 			} else {
 				// Shared default summary generator, also used by manual compaction.
-				const compactResult = await compact(
+				const compactResult = await this._runDefaultCompaction(
 					preparation,
 					requestModel,
 					apiKey,
 					headers,
 					undefined,
 					this._autoCompactionAbortController.signal,
-					this.thinkingLevel,
-					this.agent.streamFunction,
 					env,
-					this.settingsManager.getRetrySettings(),
-					this._summarizationRetryCallbacks({ source: "compaction", reason }),
-					undefined, // sessionId
-					undefined, // onPayload
-					undefined, // onResponse
-					undefined, // transport
-					undefined, // thinkingBudgets
-					undefined, // maxRetryDelayMs
-					undefined, // sourceContext
-					undefined, // turnPrefixSourceContext
+					reason,
 				);
 				summary = compactResult.summary;
 				firstKeptEntryId = compactResult.firstKeptEntryId;

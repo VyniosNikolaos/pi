@@ -20,7 +20,9 @@ Pi has two summarization mechanisms:
 | Compaction | Context exceeds threshold, or `/compact` | Summarize old messages to free up context |
 | Branch summarization | `/tree` navigation | Preserve context when switching branches |
 
-Both use the same structured summary format and track file operations cumulatively. Compaction and branch-summary requests use fresh routing session IDs and, where supported by the provider, disable prompt-cache writes because these one-off prompts are unlikely to be reused.
+Both use the same structured summary format and track file operations cumulatively. By default, compaction and branch-summary requests use fresh routing session IDs and disable prompt-cache writes because these one-off prompts are unlikely to be reused.
+
+With `PI_EXPERIMENTAL=1`, built-in compaction and branch summarization instead preserve the active provider-context prefix and routing options while continuing to disable cache writes. Branch summarization uses this path only when the shared history remains an exact prefix after context transformation and the active context leaves enough room for the summary; otherwise it falls back to standalone summarization.
 
 ## Compaction
 

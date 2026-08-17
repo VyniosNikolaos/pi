@@ -15,6 +15,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type {
 	Agent,
 	AgentEvent,
@@ -28,6 +29,7 @@ import { contentText } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AuthResult,
+	Context,
 	ImageContent,
 	Model,
 	ProviderHeaders,
@@ -54,6 +56,7 @@ import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import {
+	type BranchSummaryResult,
 	type CompactionPreparation,
 	type CompactionResult,
 	calculateContextTokens,
@@ -103,7 +106,12 @@ import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
-import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
+import {
+	buildSessionContext as buildSessionContextFromEntries,
+	CURRENT_SESSION_VERSION,
+	getLatestCompactionEntry,
+	type SessionHeader,
+} from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
@@ -3039,6 +3047,79 @@ export class AgentSession {
 	// =========================================================================
 
 	/**
+	 * Build the provider context used for experimental cache-friendly branch summarization.
+	 *
+	 * A branch summary must describe only the abandoned suffix, while a reusable provider
+	 * prefix starts at the beginning of the active context. For an active context
+	 * `[shared A, shared B, abandoned C, abandoned D]`, this method builds the full provider
+	 * context through the active agent pipeline. It separately converts `[shared A, shared B]`
+	 * without rerunning `transformContext`. If those converted shared messages are an exact
+	 * prefix of the transformed full context, their length difference identifies C and D as
+	 * the final provider-visible messages. The summarizer can then keep the full source prefix
+	 * and receive an appended instruction to summarize only that suffix.
+	 *
+	 * Returns undefined when the estimated active context exceeds
+	 * `contextWindow - reserveTokens`, leaving insufficient room for the summary instruction
+	 * and response; when context transformation/conversion does not preserve the shared prefix;
+	 * or when the abandoned branch has no provider-visible messages. The caller then uses
+	 * standalone branch summarization, which serializes only the explicitly collected abandoned
+	 * entries.
+	 *
+	 * The full context runs through `transformContext` exactly once, so coding-agent extension
+	 * `context` handlers receive one event for the branch-summary operation. The untransformed
+	 * shared conversion makes prefix validation intentionally conservative: if a context handler
+	 * changed the shared portion of the full history, validation fails and the caller falls back.
+	 */
+	private async _buildBranchSummarySource(
+		commonAncestorId: string | null,
+		signal: AbortSignal,
+		contextWindow: number,
+		reserveTokens: number,
+	): Promise<{ context: Context; branchMessageCount: number } | undefined> {
+		// Reusing the full active context adds a summarization instruction and needs room for
+		// its response. Fall back before provider conversion when that reserve is unavailable.
+		const sourceMessages = this.sessionManager.buildSessionContext().messages;
+		if (estimateContextTokens(sourceMessages).tokens > contextWindow - reserveTokens) {
+			return undefined;
+		}
+
+		// Reconstruct the history shared with the destination branch. A null common ancestor
+		// means the destination shares no session messages with the branch being abandoned.
+		const sharedMessages = commonAncestorId
+			? buildSessionContextFromEntries(this.sessionManager.getBranch(commonAncestorId)).messages
+			: [];
+
+		// Build the full source through the same current system prompt, tools, context transform,
+		// and message conversion as a normal agent request. The copied arrays prevent hooks from
+		// mutating the session manager's arrays directly.
+		const systemPrompt = this.agent.state.systemPrompt;
+		const tools = this.agent.state.tools.slice();
+		const sourceContext = await this.agent.buildProviderContext(
+			{ systemPrompt, messages: sourceMessages.slice(), tools: tools.slice() },
+			signal,
+		);
+
+		// Convert the shared history only to establish its provider-message boundary. Do not run
+		// transformContext again: extension context handlers should observe this operation once.
+		const sharedProviderMessages = await this.agent.convertToLlm(sharedMessages.slice());
+
+		// The suffix length is meaningful only if the untransformed shared conversion remains an
+		// exact prefix of the transformed full context. Any transform that changes the shared part
+		// fails this conservative check and uses standalone summarization instead.
+		if (
+			sharedProviderMessages.length > sourceContext.messages.length ||
+			!isDeepStrictEqual(sourceContext.messages.slice(0, sharedProviderMessages.length), sharedProviderMessages)
+		) {
+			return undefined;
+		}
+
+		// Everything after the shared provider prefix belongs to the abandoned branch. If all
+		// such messages were filtered out, there is no source-context suffix to summarize.
+		const branchMessageCount = sourceContext.messages.length - sharedProviderMessages.length;
+		return branchMessageCount > 0 ? { context: sourceContext, branchMessageCount } : undefined;
+	}
+
+	/**
 	 * Navigate to a different node in the session tree.
 	 * Unlike fork() which creates a new session file, this stays in the same file.
 	 *
@@ -3141,19 +3222,55 @@ export class AgentSession {
 				const model = this.model!;
 				const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(model);
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
-				const result = await generateBranchSummary(entriesToSummarize, {
-					model: requestModel,
-					apiKey,
-					headers,
-					env,
-					signal: this._branchSummaryAbortController.signal,
-					customInstructions,
-					replaceInstructions,
-					reserveTokens: branchSummarySettings.reserveTokens,
-					streamFn: this.agent.streamFunction,
-					retry: this.settingsManager.getRetrySettings(),
-					callbacks: this._summarizationRetryCallbacks({ source: "branchSummary" }),
-				});
+				// Keep experimental and normal requests separate so the normal path cannot
+				// inherit active-agent context, routing, hooks, or transport options.
+				let result: BranchSummaryResult;
+				if (areExperimentalFeaturesEnabled()) {
+					const source = await this._buildBranchSummarySource(
+						commonAncestorId,
+						this._branchSummaryAbortController.signal,
+						requestModel.contextWindow || 128000,
+						branchSummarySettings.reserveTokens,
+					);
+					result = await generateBranchSummary(
+						entriesToSummarize,
+						{
+							model: requestModel,
+							apiKey,
+							headers,
+							env,
+							signal: this._branchSummaryAbortController.signal,
+							customInstructions,
+							replaceInstructions,
+							reserveTokens: branchSummarySettings.reserveTokens,
+							streamFn: this.agent.streamFunction,
+							retry: this.settingsManager.getRetrySettings(),
+							callbacks: this._summarizationRetryCallbacks({ source: "branchSummary" }),
+							sourceContext: source?.context,
+							sourceBranchMessageCount: source?.branchMessageCount,
+							onPayload: this.agent.onPayload,
+							onResponse: this.agent.onResponse,
+							transport: this.agent.transport,
+							thinkingBudgets: this.agent.thinkingBudgets,
+							maxRetryDelayMs: this.agent.maxRetryDelayMs,
+						},
+						this.agent.sessionId,
+					);
+				} else {
+					result = await generateBranchSummary(entriesToSummarize, {
+						model: requestModel,
+						apiKey,
+						headers,
+						env,
+						signal: this._branchSummaryAbortController.signal,
+						customInstructions,
+						replaceInstructions,
+						reserveTokens: branchSummarySettings.reserveTokens,
+						streamFn: this.agent.streamFunction,
+						retry: this.settingsManager.getRetrySettings(),
+						callbacks: this._summarizationRetryCallbacks({ source: "branchSummary" }),
+					});
+				}
 				if (result.aborted) {
 					return { cancelled: true, aborted: true };
 				}

@@ -8,7 +8,7 @@
 import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
 import type { RetryCallbacks, RetryPolicy } from "@earendil-works/pi-ai";
 import { contentText } from "@earendil-works/pi-ai";
-import type { Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
+import type { Context, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
 import {
 	convertToLlm,
 	createBranchSummaryMessage,
@@ -87,6 +87,16 @@ export interface GenerateBranchSummaryOptions {
 	retry?: RetryPolicy;
 	/** Optional callbacks for retry reporting (e.g. TUI retry indicators). */
 	callbacks?: RetryCallbacks;
+	/** Active provider context whose final messages are the branch being abandoned. */
+	sourceContext?: Context;
+	/** Number of final messages in sourceContext that belong to the abandoned branch. */
+	sourceBranchMessageCount?: number;
+	/** Provider request hooks and transport settings from the active agent path. */
+	onPayload?: SimpleStreamOptions["onPayload"];
+	onResponse?: SimpleStreamOptions["onResponse"];
+	transport?: SimpleStreamOptions["transport"];
+	thinkingBudgets?: SimpleStreamOptions["thinkingBudgets"];
+	maxRetryDelayMs?: number;
 }
 
 // ============================================================================
@@ -285,14 +295,46 @@ Use this EXACT format:
 Keep each section concise. Preserve exact file paths, function names, and error messages.`;
 
 /**
+ * Build the instruction appended to a cache-friendly active branch context.
+ *
+ * The source context contains both shared history and the abandoned branch, so the
+ * provider-visible suffix length is always included to constrain the summary to the branch.
+ * `replaceInstructions` replaces the default summary format, not these boundary and tool-use
+ * constraints; removing them could summarize shared history or continue the agent tool loop.
+ *
+ * @param branchMessageCount Number of final provider-visible messages in the abandoned branch
+ * @param customInstructions Optional user-supplied focus or replacement summary instructions
+ * @param replaceInstructions Whether custom instructions replace the default summary format
+ */
+function buildSourceBranchInstructions(
+	branchMessageCount: number,
+	customInstructions?: string,
+	replaceInstructions?: boolean,
+) {
+	const boundaryInstructions = `The source conversation above is the active conversation branch being abandoned.
+Summarize only the final ${branchMessageCount} conversation ${branchMessageCount === 1 ? "message" : "messages"} immediately before this instruction. Those messages are the abandoned branch. Earlier messages are shared context and must not be summarized except where needed to understand the abandoned branch.
+
+Do not call tools. Return only the summary.`;
+	if (replaceInstructions && customInstructions) {
+		return `${boundaryInstructions}\n\n${customInstructions}`;
+	}
+	if (customInstructions) {
+		return `${boundaryInstructions}\n\n${BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: ${customInstructions}`;
+	}
+	return `${boundaryInstructions}\n\n${BRANCH_SUMMARY_PROMPT}`;
+}
+
+/**
  * Generate a summary of abandoned branch entries.
  *
  * @param entries - Session entries to summarize (chronological order)
  * @param options - Generation options
+ * @param sessionId - Optional active routing session used by cache-aware providers
  */
 export async function generateBranchSummary(
 	entries: SessionEntry[],
 	options: GenerateBranchSummaryOptions,
+	sessionId?: string,
 ): Promise<BranchSummaryResult> {
 	const {
 		model,
@@ -306,64 +348,100 @@ export async function generateBranchSummary(
 		streamFn,
 		retry,
 		callbacks,
+		sourceContext,
+		sourceBranchMessageCount,
+		onPayload,
+		onResponse,
+		transport,
+		thinkingBudgets,
+		maxRetryDelayMs,
 	} = options;
 
-	// Token budget = context window minus reserved space for prompt + response
+	// Prepare abandoned branch entries within the model's available input budget.
+	// File operations are collected from all entries even when older messages are omitted
+	// from the standalone summarization prompt by the token budget.
 	const contextWindow = model.contextWindow || 128000;
 	const tokenBudget = contextWindow - reserveTokens;
-
 	const { messages, fileOps } = prepareBranchEntries(entries, tokenBudget);
 
 	if (messages.length === 0) {
 		return { summary: "No content to summarize" };
 	}
 
-	// Transform to LLM-compatible messages, then serialize to text
-	// Serialization prevents the model from treating it as a conversation to continue
-	const llmMessages = convertToLlm(messages);
-	const conversationText = serializeConversation(llmMessages);
+	// Select the cache-friendly request shape only when the caller supplied a valid
+	// provider-visible abandoned suffix. Otherwise preserve standalone summarization.
+	const useSourceContext =
+		sourceContext !== undefined &&
+		sourceBranchMessageCount !== undefined &&
+		sourceBranchMessageCount > 0 &&
+		sourceBranchMessageCount <= sourceContext.messages.length;
 
-	// Build prompt
-	let instructions: string;
-	if (replaceInstructions && customInstructions) {
-		instructions = customInstructions;
-	} else if (customInstructions) {
-		instructions = `${BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: ${customInstructions}`;
+	// Build only an appended branch instruction for a source-context request. The
+	// standalone path instead serializes selected branch messages into an isolated prompt.
+	let promptText: string;
+	if (useSourceContext) {
+		promptText = buildSourceBranchInstructions(sourceBranchMessageCount, customInstructions, replaceInstructions);
 	} else {
-		instructions = BRANCH_SUMMARY_PROMPT;
+		// Transform to LLM-compatible messages, then serialize to text. Serialization
+		// prevents the model from treating the standalone request as a conversation to continue.
+		const llmMessages = convertToLlm(messages);
+		const conversationText = serializeConversation(llmMessages);
+		let instructions: string;
+		if (replaceInstructions && customInstructions) {
+			instructions = customInstructions;
+		} else if (customInstructions) {
+			instructions = `${BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: ${customInstructions}`;
+		} else {
+			instructions = BRANCH_SUMMARY_PROMPT;
+		}
+		promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${instructions}`;
 	}
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${instructions}`;
 
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
+	// Preserve the complete source prefix when available and append the instruction as a
+	// new message. Standalone requests retain the dedicated summarization system prompt.
+	const instructionMessage = {
+		role: "user" as const,
+		content: [{ type: "text" as const, text: promptText }],
+		timestamp: Date.now(),
+	};
+	const context: Context = useSourceContext
+		? { ...sourceContext, messages: [...sourceContext.messages, instructionMessage] }
+		: { systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: [instructionMessage] };
 
-	// Call LLM for summarization. Prefer the session stream function so SDK
-	// request behavior (timeouts, retries, attribution headers) stays consistent
-	// without running through agent state/events. Retried via completeSummarization
-	// so transient stream drops reuse the configured retry policy.
-	const context = { systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages };
-	const requestOptions: SimpleStreamOptions = { apiKey, headers, env, signal, maxTokens: 2048 };
+	// Call the LLM without running through agent state or lifecycle events. The session
+	// stream function and active request options preserve SDK/provider behavior, while
+	// completeSummarization applies the shared transient-failure retry policy.
+	const requestOptions: SimpleStreamOptions = {
+		apiKey,
+		headers,
+		env,
+		signal,
+		maxTokens: 2048,
+		sessionId,
+		onPayload,
+		onResponse,
+		transport,
+		thinkingBudgets,
+		maxRetryDelayMs,
+	};
 	const response = await completeSummarization(model, context, requestOptions, streamFn, retry, callbacks);
 
-	// Check if aborted or errored
+	// Convert provider termination states into the branch-summary result contract. Tool
+	// calls are rejected because tools are present only to preserve a source-context prefix.
 	if (response.stopReason === "aborted") {
 		return { aborted: true };
 	}
 	if (response.stopReason === "error") {
 		return { error: response.errorMessage || "Summarization failed" };
 	}
+	if (response.content.some((block) => block.type === "toolCall")) {
+		return { error: "Branch summarization attempted to call a tool" };
+	}
 
+	// Mark the generated text as abandoned-branch context, then append cumulative file
+	// tracking so later branch summaries and compactions can preserve those operations.
 	let summary = contentText(response.content);
-
-	// Prepend preamble to provide context about the branch summary
 	summary = BRANCH_SUMMARY_PREAMBLE + summary;
-
-	// Compute file lists and append to summary
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	summary += formatFileOperations(readFiles, modifiedFiles);
 

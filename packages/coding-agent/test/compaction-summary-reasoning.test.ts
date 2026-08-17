@@ -54,6 +54,12 @@ const mockSummaryResponse: AssistantMessage = {
 	timestamp: Date.now(),
 };
 
+const mockToolCallResponse: AssistantMessage = {
+	...mockSummaryResponse,
+	content: [{ type: "toolCall", id: "tool-call-1", name: "read", arguments: { path: "README.md" } }],
+	stopReason: "toolUse",
+};
+
 const messages: AgentMessage[] = [{ role: "user", content: "Summarize this.", timestamp: Date.now() }];
 
 describe("generateSummary reasoning options", () => {
@@ -169,6 +175,42 @@ describe("generateSummary reasoning options", () => {
 		expect(completeSimpleMock.mock.calls[0][2]).toMatchObject({ cacheRetention: "none" });
 	});
 
+	it("rejects tool calls from a source-context history summary", async () => {
+		completeSimpleMock.mockResolvedValueOnce(mockToolCallResponse);
+		const sourceContext: Context = {
+			systemPrompt: "You are a coding agent.",
+			messages: [{ role: "user", content: "Inspect README.md", timestamp: 1 }],
+			tools: [],
+		};
+		const preparation: CompactionPreparation = {
+			firstKeptEntryId: "entry-keep",
+			messagesToSummarize: messages,
+			turnPrefixMessages: [],
+			isSplitTurn: false,
+			tokensBefore: 100,
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 20 },
+		};
+
+		await expect(
+			compact(
+				preparation,
+				createModel(false),
+				"test-key",
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				sourceContext,
+			),
+		).rejects.toThrow("Summarization attempted to call a tool");
+	});
+
 	it("limits a source-context turn-prefix summary to the final incomplete turn", async () => {
 		const earlierUser = { role: "user" as const, content: "Earlier request", timestamp: 1 };
 		const earlierAssistant: AssistantMessage = {
@@ -222,6 +264,43 @@ describe("generateSummary reasoning options", () => {
 		expect(instruction).toContain("Do not summarize earlier turns");
 		expect(instruction).not.toContain("Earlier request");
 		expect(turnPrefixSourceContext.messages).toHaveLength(4);
+	});
+
+	it("rejects tool calls from a source-context turn-prefix summary", async () => {
+		completeSimpleMock.mockResolvedValueOnce(mockToolCallResponse);
+		const turnPrefixSourceContext: Context = {
+			systemPrompt: "You are a coding agent.",
+			messages: [{ role: "user", content: "Inspect README.md", timestamp: 1 }],
+			tools: [],
+		};
+		const preparation: CompactionPreparation = {
+			firstKeptEntryId: "entry-keep",
+			messagesToSummarize: [],
+			turnPrefixMessages: messages,
+			isSplitTurn: true,
+			tokensBefore: 100,
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 20 },
+		};
+
+		await expect(
+			compact(
+				preparation,
+				createModel(false),
+				"test-key",
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				turnPrefixSourceContext,
+			),
+		).rejects.toThrow("Turn prefix summarization attempted to call a tool");
 	});
 
 	it("does not set reasoning when thinking is off", async () => {

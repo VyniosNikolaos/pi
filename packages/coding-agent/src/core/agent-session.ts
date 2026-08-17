@@ -1881,6 +1881,7 @@ export class AgentSession {
 					this.settingsManager.getRetrySettings(),
 					this._summarizationRetryCallbacks({ source: "compaction", reason: "manual" }),
 					undefined, // sessionId
+					undefined, // sourceContext
 				);
 				summary = result.summary;
 				firstKeptEntryId = result.firstKeptEntryId;
@@ -2194,6 +2195,7 @@ export class AgentSession {
 					this.settingsManager.getRetrySettings(),
 					this._summarizationRetryCallbacks({ source: "compaction", reason }),
 					undefined, // sessionId
+					undefined, // sourceContext
 				);
 				summary = compactResult.summary;
 				firstKeptEntryId = compactResult.firstKeptEntryId;

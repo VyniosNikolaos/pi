@@ -618,8 +618,33 @@ export async function generateSummary(
 			retry,
 			callbacks,
 			sessionId,
+			undefined, // sourceContext
 		)
 	).text;
+}
+
+/**
+ * Build a standalone summarization context, or append the summarization instruction
+ * to an existing provider context without mutating its cacheable prefix.
+ */
+function buildSummarizationContext(promptText: string, sourceContext?: Context): Context {
+	const instructionMessage = {
+		role: "user" as const,
+		content: [{ type: "text" as const, text: promptText }],
+		timestamp: Date.now(),
+	};
+
+	if (sourceContext) {
+		return {
+			...sourceContext,
+			messages: [...sourceContext.messages, instructionMessage],
+		};
+	}
+
+	return {
+		systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+		messages: [instructionMessage],
+	};
 }
 
 /** Generate or update a conversation summary and return its provider usage. */
@@ -638,37 +663,33 @@ export async function generateSummaryWithUsage(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
+	sourceContext?: Context,
 ): Promise<{ text: string; usage: Usage }> {
 	const maxTokens = Math.min(
 		Math.floor(0.8 * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	);
 
-	// Use update prompt if we have a previous summary, otherwise initial prompt
-	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
+	// Cache-friendly source contexts already contain the previous compaction summary.
+	// Standalone requests still pass it separately and need the update prompt.
+	let basePrompt = previousSummary && !sourceContext ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
 	if (customInstructions) {
 		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
 	}
 
-	// Serialize conversation to text so model doesn't try to continue it
-	// Convert to LLM messages first (handles custom types like bashExecution, custom, etc.)
-	const llmMessages = convertToLlm(currentMessages);
-	const conversationText = serializeConversation(llmMessages);
-
-	// Build the prompt with conversation wrapped in tags
-	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
-	if (previousSummary) {
+	// A source context already supplies its system prompt and message prefix, so append
+	// only the summarization task. Without one, build the existing standalone request by
+	// serializing the conversation into the prompt.
+	let promptText = "";
+	if (!sourceContext) {
+		const llmMessages = convertToLlm(currentMessages);
+		const conversationText = serializeConversation(llmMessages);
+		promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
+	}
+	if (previousSummary && !sourceContext) {
 		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
 	}
 	promptText += basePrompt;
-
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
 
 	const completionOptions = createSummarizationOptions(
 		model,
@@ -683,7 +704,7 @@ export async function generateSummaryWithUsage(
 
 	const response = await completeSummarization(
 		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
+		buildSummarizationContext(promptText, sourceContext),
 		completionOptions,
 		streamFn,
 		retry,
@@ -806,7 +827,9 @@ export function prepareCompaction(
 // Main compaction function
 // ============================================================================
 
-const TURN_PREFIX_SUMMARIZATION_PROMPT = `This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
+const TURN_PREFIX_SUMMARIZATION_PROMPT = `The final turn in the source conversation was too large to keep in full. Its SUFFIX (recent work) is retained.
+
+The source conversation may also contain complete earlier turns for background. Summarize only the final, incomplete turn. It begins with the last user-role request before this instruction. Do not summarize earlier turns except for details needed to understand this final turn's prefix.
 
 Summarize the prefix to provide context for the retained suffix:
 
@@ -827,7 +850,9 @@ Be concise. Focus on what's needed to understand the kept suffix.`;
  *
  * @param preparation - Pre-calculated preparation from prepareCompaction()
  * @param customInstructions - Optional custom focus for the summary
- * @param sessionId - Optional routing session ID forwarded without enabling prompt caching
+ * @param sessionId - Optional routing session ID forwarded without enabling prompt-cache writes
+ * @param sourceContext - Exact provider context prefix containing the history to summarize
+ * @param turnPrefixSourceContext - Exact provider context prefix containing a split turn's prefix
  */
 export async function compact(
 	preparation: CompactionPreparation,
@@ -842,6 +867,8 @@ export async function compact(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
+	sourceContext?: Context,
+	turnPrefixSourceContext?: Context,
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -877,6 +904,7 @@ export async function compact(
 				retry,
 				callbacks,
 				sessionId,
+				sourceContext,
 			);
 			historyText = historyResult.text;
 			historyUsage = historyResult.usage;
@@ -894,6 +922,7 @@ export async function compact(
 			retry,
 			callbacks,
 			sessionId,
+			turnPrefixSourceContext,
 		);
 		// Merge into single summary
 		summary = `${historyText}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.text}`;
@@ -915,6 +944,7 @@ export async function compact(
 			retry,
 			callbacks,
 			sessionId,
+			sourceContext,
 		);
 		summary = result.text;
 		summaryUsage = result.usage;
@@ -953,25 +983,25 @@ async function generateTurnPrefixSummary(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
+	sourceContext?: Context,
 ): Promise<{ text: string; usage: Usage }> {
 	const maxTokens = Math.min(
 		Math.floor(0.5 * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	); // Smaller budget for turn prefix
-	const llmMessages = convertToLlm(messages);
-	const conversationText = serializeConversation(llmMessages);
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
+	// A source context already supplies its system prompt and split-turn prefix, so append
+	// only the summarization task. Otherwise retain the standalone serialized-conversation
+	// request.
+	let promptText = TURN_PREFIX_SUMMARIZATION_PROMPT;
+	if (!sourceContext) {
+		const llmMessages = convertToLlm(messages);
+		const conversationText = serializeConversation(llmMessages);
+		promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
+	}
 
 	const response = await completeSummarization(
 		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
+		buildSummarizationContext(promptText, sourceContext),
 		createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel, sessionId),
 		streamFn,
 		retry,

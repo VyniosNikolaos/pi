@@ -1,5 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Context, Model } from "@earendil-works/pi-ai";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	type CompactionPreparation,
@@ -114,6 +114,112 @@ describe("generateSummary reasoning options", () => {
 			sessionId: "current-routing-session",
 			cacheRetention: "none",
 		});
+	});
+
+	it("appends the summarization instruction to a cache-friendly source context", async () => {
+		const sourceContext: Context = {
+			systemPrompt: "You are a coding agent.",
+			messages: [{ role: "user", content: "Previous summary and original request", timestamp: 1 }],
+			tools: [],
+		};
+
+		const preparation: CompactionPreparation = {
+			firstKeptEntryId: "entry-keep",
+			messagesToSummarize: messages,
+			turnPrefixMessages: [],
+			isSplitTurn: false,
+			tokensBefore: 100,
+			previousSummary: "Previous summary",
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 20 },
+		};
+
+		await compact(
+			preparation,
+			createModel(false),
+			"test-key",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined, // sessionId
+			sourceContext,
+		);
+
+		const requestContext = completeSimpleMock.mock.calls[0][1] as Context;
+		expect(requestContext.systemPrompt).toBe(sourceContext.systemPrompt);
+		expect(requestContext.tools).toBe(sourceContext.tools);
+		expect(requestContext.messages.slice(0, -1)).toEqual(sourceContext.messages);
+		expect(requestContext.messages).toHaveLength(sourceContext.messages.length + 1);
+		expect(requestContext.messages.at(-1)).toMatchObject({ role: "user" });
+		expect(JSON.stringify(requestContext.messages.at(-1))).toContain(
+			"Create a structured context checkpoint summary",
+		);
+		expect(JSON.stringify(requestContext.messages.at(-1))).not.toContain("context summarization assistant");
+		expect(JSON.stringify(requestContext.messages.at(-1))).not.toContain("<conversation>");
+		expect(JSON.stringify(requestContext.messages.at(-1))).not.toContain("<previous-summary>");
+		expect(JSON.stringify(requestContext.messages.at(-1))).not.toContain("NEW conversation messages");
+		expect(sourceContext.messages).toHaveLength(1);
+		expect(completeSimpleMock.mock.calls[0][2]).toMatchObject({ cacheRetention: "none" });
+	});
+
+	it("limits a source-context turn-prefix summary to the final incomplete turn", async () => {
+		const earlierUser = { role: "user" as const, content: "Earlier request", timestamp: 1 };
+		const earlierAssistant: AssistantMessage = {
+			...mockSummaryResponse,
+			content: [{ type: "text", text: "Earlier work completed" }],
+			timestamp: 2,
+		};
+		const splitUser = { role: "user" as const, content: "Large final request", timestamp: 3 };
+		const earlyAssistant: AssistantMessage = {
+			...mockSummaryResponse,
+			content: [{ type: "text", text: "Early work in final turn" }],
+			timestamp: 4,
+		};
+		const turnPrefixSourceContext: Context = {
+			systemPrompt: "You are a coding agent.",
+			messages: [earlierUser, earlierAssistant, splitUser, earlyAssistant],
+			tools: [],
+		};
+		const preparation: CompactionPreparation = {
+			firstKeptEntryId: "entry-keep",
+			messagesToSummarize: [],
+			turnPrefixMessages: [splitUser, earlyAssistant],
+			isSplitTurn: true,
+			tokensBefore: 100,
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 20 },
+		};
+
+		await compact(
+			preparation,
+			createModel(false),
+			"test-key",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined, // sessionId
+			undefined, // sourceContext
+			turnPrefixSourceContext,
+		);
+
+		const requestContext = completeSimpleMock.mock.calls[0][1] as Context;
+		expect(requestContext.messages.slice(0, -1)).toEqual(turnPrefixSourceContext.messages);
+		const instruction = JSON.stringify(requestContext.messages.at(-1));
+		expect(instruction).toContain("Summarize only the final, incomplete turn");
+		expect(instruction).toContain("last user-role request before this instruction");
+		expect(instruction).toContain("Do not summarize earlier turns");
+		expect(instruction).not.toContain("Earlier request");
+		expect(turnPrefixSourceContext.messages).toHaveLength(4);
 	});
 
 	it("does not set reasoning when thinking is off", async () => {

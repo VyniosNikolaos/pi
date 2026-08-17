@@ -217,6 +217,7 @@ describe("generateSummary reasoning options", () => {
 		expect(JSON.stringify(requestContext.messages.at(-1))).toContain(
 			"Create a structured context checkpoint summary",
 		);
+		expect(JSON.stringify(requestContext.messages.at(-1))).toContain("Do not call tools. Return only the summary.");
 		expect(JSON.stringify(requestContext.messages.at(-1))).not.toContain("context summarization assistant");
 		expect(JSON.stringify(requestContext.messages.at(-1))).not.toContain("<conversation>");
 		expect(JSON.stringify(requestContext.messages.at(-1))).not.toContain("<previous-summary>");
@@ -322,6 +323,7 @@ describe("generateSummary reasoning options", () => {
 		expect(instruction).toContain("Summarize only the final, incomplete turn");
 		expect(instruction).toContain("last user-role request before this instruction");
 		expect(instruction).toContain("Do not summarize earlier turns");
+		expect(instruction).toContain("Do not call tools. Return only the summary.");
 		expect(instruction).not.toContain("Earlier request");
 		expect(turnPrefixSourceContext.messages).toHaveLength(4);
 	});

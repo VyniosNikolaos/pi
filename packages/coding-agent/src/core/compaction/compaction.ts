@@ -485,6 +485,8 @@ export function findCutPoint(
 
 const SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
 
+Do not call tools. Return only the summary.
+
 Use this EXACT format:
 
 ## Goal
@@ -903,6 +905,8 @@ export function prepareCompaction(
 const TURN_PREFIX_SUMMARIZATION_PROMPT = `The final turn in the source conversation was too large to keep in full. Its SUFFIX (recent work) is retained.
 
 The source conversation may also contain complete earlier turns for background. Summarize only the final, incomplete turn. It begins with the last user-role request before this instruction. Do not summarize earlier turns except for details needed to understand this final turn's prefix.
+
+Do not call tools. Return only the summary.
 
 Summarize the prefix to provide context for the retained suffix:
 

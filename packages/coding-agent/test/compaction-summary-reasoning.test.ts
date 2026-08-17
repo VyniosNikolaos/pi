@@ -122,6 +122,51 @@ describe("generateSummary reasoning options", () => {
 		});
 	});
 
+	it("forwards optional provider request arguments", async () => {
+		const onPayload = async (payload: unknown) => payload;
+		const onResponse = async () => {};
+		const preparation: CompactionPreparation = {
+			firstKeptEntryId: "entry-keep",
+			messagesToSummarize: messages,
+			turnPrefixMessages: [],
+			isSplitTurn: false,
+			tokensBefore: 100,
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 20 },
+		};
+
+		await compact(
+			preparation,
+			createModel(false),
+			"test-key",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			"routing-session",
+			onPayload,
+			onResponse,
+			"websocket",
+			{ low: 1234, medium: 5678 },
+			4321,
+		);
+
+		const requestOptions = completeSimpleMock.mock.calls[0][2];
+		expect(requestOptions).toMatchObject({
+			cacheRetention: "none",
+			sessionId: "routing-session",
+			transport: "websocket",
+			thinkingBudgets: { low: 1234, medium: 5678 },
+			maxRetryDelayMs: 4321,
+		});
+		expect(requestOptions?.onPayload).toBe(onPayload);
+		expect(requestOptions?.onResponse).toBe(onResponse);
+	});
+
 	it("appends the summarization instruction to a cache-friendly source context", async () => {
 		const sourceContext: Context = {
 			systemPrompt: "You are a coding agent.",
@@ -155,6 +200,11 @@ describe("generateSummary reasoning options", () => {
 			undefined,
 			undefined,
 			undefined, // sessionId
+			undefined, // onPayload
+			undefined, // onResponse
+			undefined, // transport
+			undefined, // thinkingBudgets
+			undefined, // maxRetryDelayMs
 			sourceContext,
 		);
 
@@ -205,7 +255,12 @@ describe("generateSummary reasoning options", () => {
 				undefined,
 				undefined,
 				undefined,
-				undefined,
+				undefined, // sessionId
+				undefined, // onPayload
+				undefined, // onResponse
+				undefined, // transport
+				undefined, // thinkingBudgets
+				undefined, // maxRetryDelayMs
 				sourceContext,
 			),
 		).rejects.toThrow("Summarization attempted to call a tool");
@@ -252,6 +307,11 @@ describe("generateSummary reasoning options", () => {
 			undefined,
 			undefined,
 			undefined, // sessionId
+			undefined, // onPayload
+			undefined, // onResponse
+			undefined, // transport
+			undefined, // thinkingBudgets
+			undefined, // maxRetryDelayMs
 			undefined, // sourceContext
 			turnPrefixSourceContext,
 		);
@@ -296,8 +356,13 @@ describe("generateSummary reasoning options", () => {
 				undefined,
 				undefined,
 				undefined,
-				undefined,
-				undefined,
+				undefined, // sessionId
+				undefined, // onPayload
+				undefined, // onResponse
+				undefined, // transport
+				undefined, // thinkingBudgets
+				undefined, // maxRetryDelayMs
+				undefined, // sourceContext
 				turnPrefixSourceContext,
 			),
 		).rejects.toThrow("Turn prefix summarization attempted to call a tool");

@@ -564,8 +564,25 @@ function createSummarizationOptions(
 	signal: AbortSignal | undefined,
 	thinkingLevel: ThinkingLevel | undefined,
 	sessionId: string | undefined,
+	onPayload: SimpleStreamOptions["onPayload"] | undefined,
+	onResponse: SimpleStreamOptions["onResponse"] | undefined,
+	transport: SimpleStreamOptions["transport"] | undefined,
+	thinkingBudgets: SimpleStreamOptions["thinkingBudgets"] | undefined,
+	maxRetryDelayMs: number | undefined,
 ): SimpleStreamOptions {
-	const options: SimpleStreamOptions = { maxTokens, signal, apiKey, headers, env, sessionId };
+	const options: SimpleStreamOptions = {
+		maxTokens,
+		signal,
+		apiKey,
+		headers,
+		env,
+		sessionId,
+		onPayload,
+		onResponse,
+		transport,
+		thinkingBudgets,
+		maxRetryDelayMs,
+	};
 	if (model.reasoning && thinkingLevel && thinkingLevel !== "off") {
 		options.reasoning = thinkingLevel;
 	}
@@ -620,6 +637,11 @@ export async function generateSummary(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
+	onPayload?: SimpleStreamOptions["onPayload"],
+	onResponse?: SimpleStreamOptions["onResponse"],
+	transport?: SimpleStreamOptions["transport"],
+	thinkingBudgets?: SimpleStreamOptions["thinkingBudgets"],
+	maxRetryDelayMs?: number,
 ): Promise<string> {
 	return (
 		await generateSummaryWithUsage(
@@ -637,6 +659,11 @@ export async function generateSummary(
 			retry,
 			callbacks,
 			sessionId,
+			onPayload,
+			onResponse,
+			transport,
+			thinkingBudgets,
+			maxRetryDelayMs,
 			undefined, // sourceContext
 		)
 	).text;
@@ -682,6 +709,11 @@ export async function generateSummaryWithUsage(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
+	onPayload?: SimpleStreamOptions["onPayload"],
+	onResponse?: SimpleStreamOptions["onResponse"],
+	transport?: SimpleStreamOptions["transport"],
+	thinkingBudgets?: SimpleStreamOptions["thinkingBudgets"],
+	maxRetryDelayMs?: number,
 	sourceContext?: Context,
 ): Promise<{ text: string; usage: Usage }> {
 	const maxTokens = Math.min(
@@ -719,6 +751,11 @@ export async function generateSummaryWithUsage(
 		signal,
 		thinkingLevel,
 		sessionId,
+		onPayload,
+		onResponse,
+		transport,
+		thinkingBudgets,
+		maxRetryDelayMs,
 	);
 
 	const response = await completeSummarization(
@@ -887,6 +924,11 @@ Be concise. Focus on what's needed to understand the kept suffix.`;
  * @param preparation - Pre-calculated preparation from prepareCompaction()
  * @param customInstructions - Optional custom focus for the summary
  * @param sessionId - Optional routing session ID forwarded without enabling prompt-cache writes
+ * @param onPayload - Optional provider-payload hook from the active agent request path
+ * @param onResponse - Optional provider-response hook from the active agent request path
+ * @param transport - Optional transport preference from the active agent request path
+ * @param thinkingBudgets - Optional thinking budgets from the active agent request path
+ * @param maxRetryDelayMs - Optional provider retry-delay cap from the active agent request path
  * @param sourceContext - Exact provider context prefix containing the history to summarize
  * @param turnPrefixSourceContext - Exact provider context prefix containing a split turn's prefix
  */
@@ -903,6 +945,11 @@ export async function compact(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
+	onPayload?: SimpleStreamOptions["onPayload"],
+	onResponse?: SimpleStreamOptions["onResponse"],
+	transport?: SimpleStreamOptions["transport"],
+	thinkingBudgets?: SimpleStreamOptions["thinkingBudgets"],
+	maxRetryDelayMs?: number,
 	sourceContext?: Context,
 	turnPrefixSourceContext?: Context,
 ): Promise<CompactionResult> {
@@ -940,6 +987,11 @@ export async function compact(
 				retry,
 				callbacks,
 				sessionId,
+				onPayload,
+				onResponse,
+				transport,
+				thinkingBudgets,
+				maxRetryDelayMs,
 				sourceContext,
 			);
 			historyText = historyResult.text;
@@ -958,6 +1010,11 @@ export async function compact(
 			retry,
 			callbacks,
 			sessionId,
+			onPayload,
+			onResponse,
+			transport,
+			thinkingBudgets,
+			maxRetryDelayMs,
 			turnPrefixSourceContext,
 		);
 		// Merge into single summary
@@ -980,6 +1037,11 @@ export async function compact(
 			retry,
 			callbacks,
 			sessionId,
+			onPayload,
+			onResponse,
+			transport,
+			thinkingBudgets,
+			maxRetryDelayMs,
 			sourceContext,
 		);
 		summary = result.text;
@@ -1019,6 +1081,11 @@ async function generateTurnPrefixSummary(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
+	onPayload?: SimpleStreamOptions["onPayload"],
+	onResponse?: SimpleStreamOptions["onResponse"],
+	transport?: SimpleStreamOptions["transport"],
+	thinkingBudgets?: SimpleStreamOptions["thinkingBudgets"],
+	maxRetryDelayMs?: number,
 	sourceContext?: Context,
 ): Promise<{ text: string; usage: Usage }> {
 	const maxTokens = Math.min(
@@ -1038,7 +1105,21 @@ async function generateTurnPrefixSummary(
 	const response = await completeSummarization(
 		model,
 		buildSummarizationContext(promptText, sourceContext),
-		createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel, sessionId),
+		createSummarizationOptions(
+			model,
+			maxTokens,
+			apiKey,
+			headers,
+			env,
+			signal,
+			thinkingLevel,
+			sessionId,
+			onPayload,
+			onResponse,
+			transport,
+			thinkingBudgets,
+			maxRetryDelayMs,
+		),
 		streamFn,
 		retry,
 		callbacks,

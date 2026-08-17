@@ -126,7 +126,9 @@ describe("generateSummary reasoning options", () => {
 		const preparation: CompactionPreparation = {
 			firstKeptEntryId: "entry-keep",
 			messagesToSummarize: messages,
+			sourceMessages: messages,
 			turnPrefixMessages: [],
+			turnPrefixSourceMessages: [],
 			isSplitTurn: false,
 			tokensBefore: 100,
 			previousSummary: "Previous summary",
@@ -266,7 +268,9 @@ describe("generateSummary reasoning options", () => {
 		const preparation: CompactionPreparation = {
 			firstKeptEntryId: "entry-keep",
 			messagesToSummarize: messages,
+			sourceMessages: messages,
 			turnPrefixMessages: messages,
+			turnPrefixSourceMessages: messages,
 			isSplitTurn: true,
 			tokensBefore: 600000,
 			fileOps: { read: new Set(), written: new Set(), edited: new Set() },

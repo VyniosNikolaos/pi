@@ -84,6 +84,25 @@ function getMessageFromEntryForCompaction(entry: SessionEntry): AgentMessage | u
 	return sessionEntryToContextMessages(entry)[0];
 }
 
+/** Build an active-context prefix, placing the previous compaction summary before its retained messages. */
+function collectSourceMessages(
+	entries: SessionEntry[],
+	startIndex: number,
+	endIndex: number,
+	previousCompactionIndex: number,
+): AgentMessage[] {
+	const messages: AgentMessage[] = [];
+	if (previousCompactionIndex >= 0) {
+		messages.push(...sessionEntryToContextMessages(entries[previousCompactionIndex]));
+	}
+	for (let i = startIndex; i < endIndex; i++) {
+		if (entries[i].type !== "compaction") {
+			messages.push(...sessionEntryToContextMessages(entries[i]));
+		}
+	}
+	return messages;
+}
+
 /** Result from compact() - SessionManager adds uuid/parentUuid when saving */
 export interface CompactionResult<T = unknown> {
 	summary: string;
@@ -729,8 +748,15 @@ export interface CompactionPreparation {
 	firstKeptEntryId: string;
 	/** Messages that will be summarized and discarded */
 	messagesToSummarize: AgentMessage[];
+	/**
+	 * Cache-friendly active-context prefix for the history summary.
+	 * Includes the previous compaction summary before messages retained by that compaction.
+	 */
+	sourceMessages?: AgentMessage[];
 	/** Messages that will be turned into turn prefix summary (if splitting) */
 	turnPrefixMessages: AgentMessage[];
+	/** Cache-friendly active-context prefix through the split-turn prefix, or empty when not splitting. */
+	turnPrefixSourceMessages?: AgentMessage[];
 	/** Whether this is a split turn (cut point in middle of turn) */
 	isSplitTurn: boolean;
 	tokensBefore: number;
@@ -788,6 +814,8 @@ export function prepareCompaction(
 		if (msg) messagesToSummarize.push(msg);
 	}
 
+	const sourceMessages = collectSourceMessages(pathEntries, boundaryStart, historyEnd, prevCompactionIndex);
+
 	// Messages for turn prefix summary (if splitting a turn)
 	const turnPrefixMessages: AgentMessage[] = [];
 	if (cutPoint.isSplitTurn) {
@@ -796,6 +824,9 @@ export function prepareCompaction(
 			if (msg) turnPrefixMessages.push(msg);
 		}
 	}
+	const turnPrefixSourceMessages = cutPoint.isSplitTurn
+		? collectSourceMessages(pathEntries, boundaryStart, cutPoint.firstKeptEntryIndex, prevCompactionIndex)
+		: [];
 
 	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0) {
 		return undefined;
@@ -814,7 +845,9 @@ export function prepareCompaction(
 	return {
 		firstKeptEntryId,
 		messagesToSummarize,
+		sourceMessages,
 		turnPrefixMessages,
+		turnPrefixSourceMessages,
 		isSplitTurn: cutPoint.isSplitTurn,
 		tokensBefore,
 		previousSummary,

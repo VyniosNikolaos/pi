@@ -22,7 +22,7 @@ Pi has two summarization mechanisms:
 
 Both use the same structured summary format and track file operations cumulatively. By default, compaction and branch-summary requests use fresh routing session IDs and disable prompt-cache writes because these one-off prompts are unlikely to be reused.
 
-With `PI_EXPERIMENTAL=1`, built-in compaction and branch summarization instead preserve the active provider-context prefix and routing options while continuing to disable cache writes. Branch summarization uses this path only when the shared history remains an exact prefix after context transformation and the active context leaves enough room for the summary; otherwise it falls back to standalone summarization.
+With `PI_EXPERIMENTAL=1`, built-in compaction and branch summarization instead preserve the active provider-context prefix and routing options with short prompt-cache retention, allowing providers to reuse the active prefix. Branch summarization uses this path only when the shared history remains an exact prefix after context transformation and the active context leaves enough room for the summary; otherwise it falls back to standalone summarization without prompt caching.
 
 ## Compaction
 

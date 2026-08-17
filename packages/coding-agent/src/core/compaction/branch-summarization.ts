@@ -417,6 +417,7 @@ export async function generateBranchSummary(
 		env,
 		signal,
 		maxTokens: 2048,
+		cacheRetention: useSourceContext ? "short" : undefined,
 		sessionId,
 		onPayload,
 		onResponse,

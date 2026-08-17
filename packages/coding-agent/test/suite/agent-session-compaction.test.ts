@@ -385,7 +385,7 @@ describe("AgentSession compaction characterization", () => {
 			expect(requestContexts[i].messages.slice(0, -1)).toEqual(await originalConvertToLlm(transformedSource));
 			expect(JSON.stringify(requestContexts[i].messages.at(-1))).toContain("Do not call tools");
 			expect(requestOptions[i]).toMatchObject({
-				cacheRetention: "none",
+				cacheRetention: "short",
 				sessionId: "compaction-routing-session",
 				transport: "websocket",
 				thinkingBudgets: { low: 1234 },

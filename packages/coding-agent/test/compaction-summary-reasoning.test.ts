@@ -109,7 +109,7 @@ describe("generateSummary reasoning options", () => {
 		expect(sessionIds[0]).not.toBe(sessionIds[1]);
 	});
 
-	it("honors a caller-supplied routing session without prompt caching", async () => {
+	it("honors caller-supplied cache retention and routing", async () => {
 		await completeSummarization(
 			createModel(false),
 			{ systemPrompt: "Summarize", messages: [] },
@@ -118,7 +118,7 @@ describe("generateSummary reasoning options", () => {
 
 		expect(completeSimpleMock.mock.calls[0][2]).toMatchObject({
 			sessionId: "current-routing-session",
-			cacheRetention: "none",
+			cacheRetention: "long",
 		});
 	});
 
@@ -223,7 +223,7 @@ describe("generateSummary reasoning options", () => {
 		expect(JSON.stringify(requestContext.messages.at(-1))).not.toContain("<previous-summary>");
 		expect(JSON.stringify(requestContext.messages.at(-1))).not.toContain("NEW conversation messages");
 		expect(sourceContext.messages).toHaveLength(1);
-		expect(completeSimpleMock.mock.calls[0][2]).toMatchObject({ cacheRetention: "none" });
+		expect(completeSimpleMock.mock.calls[0][2]).toMatchObject({ cacheRetention: "short" });
 	});
 
 	it("rejects tool calls from a source-context history summary", async () => {

@@ -1811,8 +1811,7 @@ export class AgentSession {
 	 * `transformContext` and `convertToLlm` pipeline, retains its system prompt and tools,
 	 * and forwards its routing and provider request options. This makes the prefix match a
 	 * normal agent request so providers can read it from prompt cache. The summarization
-	 * instruction is appended after that prefix and cache writes remain disabled because
-	 * the resulting one-off request is not expected to be reused.
+	 * instruction is appended after that prefix with short cache retention.
 	 */
 	private async _runDefaultCompaction(
 		preparation: CompactionPreparation,

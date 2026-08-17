@@ -125,7 +125,7 @@ describe("issue #6324 branch summary ambient auth", () => {
 		expect(instruction).toContain("final 3 conversation messages");
 		expect(instruction).toContain("Earlier messages are shared context");
 		expect(requestOptions).toMatchObject({
-			cacheRetention: "none",
+			cacheRetention: "short",
 			sessionId: "branch-routing-session",
 			transport: "websocket",
 			thinkingBudgets: { low: 1234 },

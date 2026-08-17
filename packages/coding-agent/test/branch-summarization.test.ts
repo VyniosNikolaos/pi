@@ -102,7 +102,7 @@ describe("branch summarization contexts", () => {
 		expect(instruction).toContain("Do not call tools. Return only the summary.");
 		expect(instruction).not.toContain("<conversation>");
 		expect(requestOptions).toMatchObject({
-			cacheRetention: "none",
+			cacheRetention: "short",
 			sessionId: "active-session",
 			transport: "websocket",
 			thinkingBudgets: { low: 1234 },

@@ -571,6 +571,7 @@ function createSummarizationOptions(
 	transport: SimpleStreamOptions["transport"] | undefined,
 	thinkingBudgets: SimpleStreamOptions["thinkingBudgets"] | undefined,
 	maxRetryDelayMs: number | undefined,
+	cacheRetention: SimpleStreamOptions["cacheRetention"] | undefined,
 ): SimpleStreamOptions {
 	const options: SimpleStreamOptions = {
 		maxTokens,
@@ -584,6 +585,7 @@ function createSummarizationOptions(
 		transport,
 		thinkingBudgets,
 		maxRetryDelayMs,
+		cacheRetention,
 	};
 	if (model.reasoning && thinkingLevel && thinkingLevel !== "off") {
 		options.reasoning = thinkingLevel;
@@ -606,11 +608,12 @@ export async function completeSummarization(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 ): Promise<AssistantMessage> {
-	// Avoid cache writes for one-off summaries. Reuse caller-supplied routing when available;
-	// callers without a session ID, including branch summaries, receive a fresh routing ID.
+	// Standalone one-off summaries default to no prompt caching. Cache-friendly callers
+	// explicitly request short retention so providers can reuse the active prefix.
+	// Callers without a session ID, including standalone branch summaries, receive a fresh routing ID.
 	const requestOptions: SimpleStreamOptions = {
 		...options,
-		cacheRetention: "none",
+		cacheRetention: options.cacheRetention ?? "none",
 		sessionId: options.sessionId ?? uuidv7(),
 	};
 	const produce = async (): Promise<AssistantMessage> =>
@@ -758,6 +761,7 @@ export async function generateSummaryWithUsage(
 		transport,
 		thinkingBudgets,
 		maxRetryDelayMs,
+		sourceContext ? "short" : undefined,
 	);
 
 	const response = await completeSummarization(
@@ -927,7 +931,7 @@ Be concise. Focus on what's needed to understand the kept suffix.`;
  *
  * @param preparation - Pre-calculated preparation from prepareCompaction()
  * @param customInstructions - Optional custom focus for the summary
- * @param sessionId - Optional routing session ID forwarded without enabling prompt-cache writes
+ * @param sessionId - Optional routing session ID forwarded to the summarization request
  * @param onPayload - Optional provider-payload hook from the active agent request path
  * @param onResponse - Optional provider-response hook from the active agent request path
  * @param transport - Optional transport preference from the active agent request path
@@ -1123,6 +1127,7 @@ async function generateTurnPrefixSummary(
 			transport,
 			thinkingBudgets,
 			maxRetryDelayMs,
+			sourceContext ? "short" : undefined,
 		),
 		streamFn,
 		retry,

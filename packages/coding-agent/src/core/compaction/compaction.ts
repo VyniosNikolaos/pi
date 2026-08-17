@@ -95,6 +95,25 @@ function getMessageFromEntryForCompaction(entry: SessionEntry): AgentMessage | u
 	return sessionEntryToContextMessages(entry)[0];
 }
 
+/** Build an active-context prefix, placing the previous compaction summary before its retained messages. */
+function collectSourceMessages(
+	entries: SessionEntry[],
+	startIndex: number,
+	endIndex: number,
+	previousCompactionIndex: number,
+): AgentMessage[] {
+	const messages: AgentMessage[] = [];
+	if (previousCompactionIndex >= 0) {
+		messages.push(...sessionEntryToContextMessages(entries[previousCompactionIndex]));
+	}
+	for (let i = startIndex; i < endIndex; i++) {
+		if (entries[i].type !== "compaction") {
+			messages.push(...sessionEntryToContextMessages(entries[i]));
+		}
+	}
+	return messages;
+}
+
 /** Result from compact() - SessionManager adds uuid/parentUuid when saving */
 export interface CompactionResult<T = unknown> {
 	summary: string;
@@ -138,6 +157,19 @@ export interface CompactionSettings {
 	enabled: boolean;
 	reserveTokens: number;
 	keepRecentTokens: number;
+}
+
+/** Active provider contexts and request settings used to preserve cacheable compaction prefixes. */
+export interface CacheFriendlySummaryOptions {
+	/** Exact provider context prefix containing the history to summarize. */
+	sourceContext?: Context;
+	/** Exact provider context prefix containing a split turn's prefix. */
+	turnPrefixSourceContext?: Context;
+	/** Provider request settings copied from the active agent request path. */
+	requestOptions?: Pick<
+		SimpleStreamOptions,
+		"sessionId" | "onPayload" | "onResponse" | "transport" | "thinkingBudgets" | "maxRetryDelayMs"
+	>;
 }
 
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
@@ -556,8 +588,19 @@ function createSummarizationOptions(
 	signal: AbortSignal | undefined,
 	thinkingLevel: ThinkingLevel | undefined,
 	sessionId: string | undefined,
+	requestOptions?: CacheFriendlySummaryOptions["requestOptions"],
+	cacheRetention?: SimpleStreamOptions["cacheRetention"],
 ): SimpleStreamOptions {
-	const options: SimpleStreamOptions = { maxTokens, signal, apiKey, headers, env, sessionId };
+	const options: SimpleStreamOptions = {
+		...requestOptions,
+		maxTokens,
+		signal,
+		apiKey,
+		headers,
+		env,
+		sessionId: requestOptions?.sessionId ?? sessionId,
+		cacheRetention,
+	};
 	const refusalFallbacks = getAnthropicSummarizationFallback(model);
 	if (refusalFallbacks) {
 		options.refusalFallbacks = refusalFallbacks;
@@ -583,11 +626,12 @@ export async function completeSummarization(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 ): Promise<AssistantMessage> {
-	// Avoid cache writes for one-off summaries. Reuse caller-supplied routing when available;
-	// callers without a session ID, including branch summaries, receive a fresh routing ID.
+	// Standalone one-off summaries default to no prompt caching. Cache-friendly callers
+	// explicitly request short retention so providers can reuse the active prefix.
+	// Callers without a session ID, including standalone branch summaries, receive a fresh routing ID.
 	const requestOptions: SimpleStreamOptions = {
 		...options,
-		cacheRetention: "none",
+		cacheRetention: options.cacheRetention ?? "none",
 		sessionId: options.sessionId ?? uuidv7(),
 		toolChoice: "none",
 	};
@@ -617,6 +661,7 @@ export async function generateSummary(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
+	cacheFriendly?: Pick<CacheFriendlySummaryOptions, "sourceContext" | "requestOptions">,
 ): Promise<string> {
 	return (
 		await generateSummaryWithUsage(
@@ -634,8 +679,30 @@ export async function generateSummary(
 			retry,
 			callbacks,
 			sessionId,
+			cacheFriendly,
 		)
 	).text;
+}
+
+/** Build a standalone summary request or append its instruction to an existing provider context. */
+function buildSummarizationContext(promptText: string, sourceContext?: Context): Context {
+	const instructionMessage = {
+		role: "user" as const,
+		content: [{ type: "text" as const, text: promptText }],
+		timestamp: Date.now(),
+	};
+
+	if (sourceContext) {
+		return {
+			...sourceContext,
+			messages: [...sourceContext.messages, instructionMessage],
+		};
+	}
+
+	return {
+		systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+		messages: [instructionMessage],
+	};
 }
 
 /** Generate or update a conversation summary and return its provider usage. */
@@ -654,37 +721,33 @@ export async function generateSummaryWithUsage(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
+	cacheFriendly?: Pick<CacheFriendlySummaryOptions, "sourceContext" | "requestOptions">,
 ): Promise<{ text: string; usage: Usage }> {
 	const maxTokens = Math.min(
 		Math.floor(0.8 * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	);
+	const sourceContext = cacheFriendly?.sourceContext;
 
-	// Use update prompt if we have a previous summary, otherwise initial prompt
-	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
+	// Cache-friendly source contexts already contain the previous compaction summary.
+	// Standalone requests still pass it separately and need the update prompt.
+	let basePrompt = previousSummary && !sourceContext ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
 	if (customInstructions) {
 		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
 	}
 
-	// Serialize conversation to text so model doesn't try to continue it
-	// Convert to LLM messages first (handles custom types like bashExecution, custom, etc.)
-	const llmMessages = convertToLlm(currentMessages);
-	const conversationText = serializeConversation(llmMessages);
-
-	// Build the prompt with conversation wrapped in tags
-	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
-	if (previousSummary) {
+	// Source contexts already contain the conversation. Standalone requests serialize it
+	// so the model treats those messages as data rather than continuing the conversation.
+	let promptText = "";
+	if (!sourceContext) {
+		const llmMessages = convertToLlm(currentMessages);
+		const conversationText = serializeConversation(llmMessages);
+		promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
+	}
+	if (previousSummary && !sourceContext) {
 		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
 	}
 	promptText += basePrompt;
-
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
 
 	const completionOptions = createSummarizationOptions(
 		model,
@@ -695,11 +758,13 @@ export async function generateSummaryWithUsage(
 		signal,
 		thinkingLevel,
 		sessionId,
+		sourceContext ? cacheFriendly?.requestOptions : undefined,
+		sourceContext ? "short" : undefined,
 	);
 
 	const response = await completeSummarization(
 		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
+		buildSummarizationContext(promptText, sourceContext),
 		completionOptions,
 		streamFn,
 		retry,
@@ -727,8 +792,15 @@ export interface CompactionPreparation {
 	firstKeptEntryId: string;
 	/** Messages that will be summarized and discarded */
 	messagesToSummarize: AgentMessage[];
+	/**
+	 * Active-context prefix for the history summary.
+	 * Includes the previous compaction summary before messages retained by that compaction.
+	 */
+	sourceMessages?: AgentMessage[];
 	/** Messages that will be turned into turn prefix summary (if splitting) */
 	turnPrefixMessages: AgentMessage[];
+	/** Active-context prefix through the split-turn prefix, or empty when not splitting. */
+	turnPrefixSourceMessages?: AgentMessage[];
 	/** Whether this is a split turn (cut point in middle of turn) */
 	isSplitTurn: boolean;
 	tokensBefore: number;
@@ -786,6 +858,8 @@ export function prepareCompaction(
 		if (msg) messagesToSummarize.push(msg);
 	}
 
+	const sourceMessages = collectSourceMessages(pathEntries, boundaryStart, historyEnd, prevCompactionIndex);
+
 	// Messages for turn prefix summary (if splitting a turn)
 	const turnPrefixMessages: AgentMessage[] = [];
 	if (cutPoint.isSplitTurn) {
@@ -794,6 +868,9 @@ export function prepareCompaction(
 			if (msg) turnPrefixMessages.push(msg);
 		}
 	}
+	const turnPrefixSourceMessages = cutPoint.isSplitTurn
+		? collectSourceMessages(pathEntries, boundaryStart, cutPoint.firstKeptEntryIndex, prevCompactionIndex)
+		: [];
 
 	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0) {
 		return undefined;
@@ -812,7 +889,9 @@ export function prepareCompaction(
 	return {
 		firstKeptEntryId,
 		messagesToSummarize,
+		sourceMessages,
 		turnPrefixMessages,
+		turnPrefixSourceMessages,
 		isSplitTurn: cutPoint.isSplitTurn,
 		tokensBefore,
 		previousSummary,
@@ -840,13 +919,31 @@ Summarize the prefix to provide context for the retained suffix:
 
 Be concise. Focus on what's needed to understand the kept suffix.`;
 
+const SOURCE_CONTEXT_TURN_PREFIX_SUMMARIZATION_PROMPT = `The final turn in the source conversation was too large to keep in full. Its SUFFIX (recent work) is retained.
+
+The source conversation may also contain complete earlier turns for background. Summarize only the final, incomplete turn. It begins with the last user-role request before this instruction. Do not summarize earlier turns except for details needed to understand this final turn's prefix.
+
+Summarize the prefix to provide context for the retained suffix:
+
+## Original Request
+[What did the user ask for in this turn?]
+
+## Early Progress
+- [Key decisions and work done in the prefix]
+
+## Context for Suffix
+- [Information needed to understand the retained recent work]
+
+Be concise. Focus on what's needed to understand the kept suffix.`;
+
 /**
  * Generate summaries for compaction using prepared data.
  * Returns CompactionResult - SessionManager adds uuid/parentUuid when saving.
  *
  * @param preparation - Pre-calculated preparation from prepareCompaction()
  * @param customInstructions - Optional custom focus for the summary
- * @param sessionId - Optional routing session ID forwarded without enabling prompt caching
+ * @param sessionId - Optional standalone routing session ID
+ * @param cacheFriendly - Active provider contexts and request settings for cache-friendly summarization
  */
 export async function compact(
 	preparation: CompactionPreparation,
@@ -861,6 +958,7 @@ export async function compact(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
+	cacheFriendly?: CacheFriendlySummaryOptions,
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -896,6 +994,10 @@ export async function compact(
 				retry,
 				callbacks,
 				sessionId,
+				{
+					sourceContext: cacheFriendly?.sourceContext,
+					requestOptions: cacheFriendly?.requestOptions,
+				},
 			);
 			historyText = historyResult.text;
 			historyUsage = historyResult.usage;
@@ -913,6 +1015,10 @@ export async function compact(
 			retry,
 			callbacks,
 			sessionId,
+			{
+				sourceContext: cacheFriendly?.turnPrefixSourceContext,
+				requestOptions: cacheFriendly?.requestOptions,
+			},
 		);
 		// Merge into single summary
 		summary = `${historyText}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.text}`;
@@ -934,6 +1040,10 @@ export async function compact(
 			retry,
 			callbacks,
 			sessionId,
+			{
+				sourceContext: cacheFriendly?.sourceContext,
+				requestOptions: cacheFriendly?.requestOptions,
+			},
 		);
 		summary = result.text;
 		summaryUsage = result.usage;
@@ -972,26 +1082,37 @@ async function generateTurnPrefixSummary(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
+	cacheFriendly?: Pick<CacheFriendlySummaryOptions, "sourceContext" | "requestOptions">,
 ): Promise<{ text: string; usage: Usage }> {
 	const maxTokens = Math.min(
 		Math.floor(0.5 * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	); // Smaller budget for turn prefix
-	const llmMessages = convertToLlm(messages);
-	const conversationText = serializeConversation(llmMessages);
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
+	const sourceContext = cacheFriendly?.sourceContext;
+	let promptText: string;
+	if (sourceContext) {
+		promptText = SOURCE_CONTEXT_TURN_PREFIX_SUMMARIZATION_PROMPT;
+	} else {
+		const llmMessages = convertToLlm(messages);
+		const conversationText = serializeConversation(llmMessages);
+		promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
+	}
 
 	const response = await completeSummarization(
 		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel, sessionId),
+		buildSummarizationContext(promptText, sourceContext),
+		createSummarizationOptions(
+			model,
+			maxTokens,
+			apiKey,
+			headers,
+			env,
+			signal,
+			thinkingLevel,
+			sessionId,
+			sourceContext ? cacheFriendly?.requestOptions : undefined,
+			sourceContext ? "short" : undefined,
+		),
 		streamFn,
 		retry,
 		callbacks,

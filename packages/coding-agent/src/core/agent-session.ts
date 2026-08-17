@@ -15,6 +15,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type {
 	Agent,
 	AgentEvent,
@@ -28,6 +29,7 @@ import { contentText } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AuthResult,
+	Context,
 	ImageContent,
 	Model,
 	ProviderHeaders,
@@ -54,6 +56,7 @@ import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import {
+	type CompactionPreparation,
 	type CompactionResult,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
@@ -65,6 +68,7 @@ import {
 	shouldCompact,
 } from "./compaction/index.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
+import { areExperimentalFeaturesEnabled } from "./experimental.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
@@ -1789,6 +1793,92 @@ export class AgentSession {
 	// Compaction
 	// =========================================================================
 
+	/** Generate Pi's built-in compaction summary for manual and automatic compaction. */
+	private async _runDefaultCompaction(
+		preparation: CompactionPreparation,
+		requestModel: Model<any>,
+		apiKey: string | undefined,
+		headers: Record<string, string> | undefined,
+		customInstructions: string | undefined,
+		signal: AbortSignal,
+		env: Record<string, string> | undefined,
+		reason: "manual" | "threshold" | "overflow",
+	): Promise<CompactionResult> {
+		// Preserve standalone summarization outside experimental mode.
+		if (!areExperimentalFeaturesEnabled()) {
+			return compact(
+				preparation,
+				requestModel,
+				apiKey,
+				headers,
+				customInstructions,
+				signal,
+				this.thinkingLevel,
+				this.agent.streamFunction,
+				env,
+				this.settingsManager.getRetrySettings(),
+				this._summarizationRetryCallbacks({ source: "compaction", reason }),
+			);
+		}
+
+		const systemPrompt = this.agent.state.systemPrompt;
+		const tools = this.agent.state.tools.slice();
+		const buildSourceContext = async (messages: AgentMessage[]) =>
+			this.agent.buildProviderContext({ systemPrompt, messages: messages.slice(), tools: tools.slice() }, signal);
+
+		const sourceContext =
+			preparation.messagesToSummarize.length > 0 && preparation.sourceMessages
+				? await buildSourceContext(preparation.sourceMessages)
+				: undefined;
+
+		// A split-turn instruction identifies the turn at the end of its source context.
+		// If a context transform appends provider-visible messages, use standalone
+		// summarization instead so the wrong turn cannot be summarized.
+		let turnPrefixSourceContext: Context | undefined;
+		if (
+			preparation.isSplitTurn &&
+			preparation.turnPrefixMessages.length > 0 &&
+			preparation.turnPrefixSourceMessages
+		) {
+			const candidateContext = await buildSourceContext(preparation.turnPrefixSourceMessages);
+			const providerTurnPrefix = await this.agent.convertToLlm(preparation.turnPrefixMessages.slice());
+			if (
+				providerTurnPrefix.length > 0 &&
+				providerTurnPrefix.length <= candidateContext.messages.length &&
+				isDeepStrictEqual(candidateContext.messages.slice(-providerTurnPrefix.length), providerTurnPrefix)
+			) {
+				turnPrefixSourceContext = candidateContext;
+			}
+		}
+
+		return compact(
+			preparation,
+			requestModel,
+			apiKey,
+			headers,
+			customInstructions,
+			signal,
+			this.thinkingLevel,
+			this.agent.streamFunction,
+			env,
+			this.settingsManager.getRetrySettings(),
+			this._summarizationRetryCallbacks({ source: "compaction", reason }),
+			undefined,
+			{
+				sourceContext,
+				turnPrefixSourceContext,
+				requestOptions: {
+					sessionId: this.agent.sessionId,
+					onPayload: this.agent.onPayload,
+					onResponse: this.agent.onResponse,
+					transport: this.agent.transport,
+					thinkingBudgets: this.agent.thinkingBudgets,
+					maxRetryDelayMs: this.agent.maxRetryDelayMs,
+				},
+			},
+		);
+	}
+
 	/**
 	 * Manually compact the session context.
 	 *
@@ -1868,19 +1958,15 @@ export class AgentSession {
 				details = extensionCompaction.details;
 			} else {
 				// Shared default summary generator, also used by automatic compaction.
-				const result = await compact(
+				const result = await this._runDefaultCompaction(
 					preparation,
 					requestModel,
 					apiKey,
 					headers,
 					customInstructions,
 					this._compactionAbortController.signal,
-					this.thinkingLevel,
-					this.agent.streamFunction,
 					env,
-					this.settingsManager.getRetrySettings(),
-					this._summarizationRetryCallbacks({ source: "compaction", reason: "manual" }),
-					undefined, // sessionId
+					"manual",
 				);
 				summary = result.summary;
 				firstKeptEntryId = result.firstKeptEntryId;
@@ -2181,19 +2267,15 @@ export class AgentSession {
 				details = extensionCompaction.details;
 			} else {
 				// Shared default summary generator, also used by manual compaction.
-				const compactResult = await compact(
+				const compactResult = await this._runDefaultCompaction(
 					preparation,
 					requestModel,
 					apiKey,
 					headers,
 					undefined,
 					this._autoCompactionAbortController.signal,
-					this.thinkingLevel,
-					this.agent.streamFunction,
 					env,
-					this.settingsManager.getRetrySettings(),
-					this._summarizationRetryCallbacks({ source: "compaction", reason }),
-					undefined, // sessionId
+					reason,
 				);
 				summary = compactResult.summary;
 				firstKeptEntryId = compactResult.firstKeptEntryId;
